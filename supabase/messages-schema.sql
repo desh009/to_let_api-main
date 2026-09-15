@@ -1,5 +1,5 @@
 -- =====================================================
--- Realtime Chat & Messaging Schema
+-- Realtime Chat & Messaging Schema (FIXED)
 -- =====================================================
 
 -- 1. Conversations Table
@@ -7,40 +7,42 @@
 CREATE TABLE IF NOT EXISTS public.conversations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   listing_id bigint REFERENCES public.to_let_api(id) ON DELETE CASCADE,
-  
+
   -- Participants
   buyer_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   seller_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
-  
+
   -- Last message info for list view
   last_message_text text,
   last_message_time timestamptz,
   last_message_sender_id uuid REFERENCES auth.users(id),
-  
+
   -- Unread counts
   buyer_unread_count integer DEFAULT 0,
   seller_unread_count integer DEFAULT 0,
-  
+
   -- Status
   is_archived boolean DEFAULT false,
   is_blocked boolean DEFAULT false,
   blocked_by_user_id uuid REFERENCES auth.users(id),
-  
+
   -- Metadata
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  
+
   -- Ensure unique conversation per listing between two users
   CONSTRAINT unique_listing_conversation UNIQUE (listing_id, buyer_id, seller_id),
-  
+
   -- Ensure at least one participant is not null and buyer/seller are different
-  CONSTRAINT check_participants CHECK (buyer_id != seller_id),
-  
-  -- For direct messages without listing, ensure uniqueness
-  CONSTRAINT unique_direct_conversation UNIQUE NULLS NOT DISTINCT (
-    CASE WHEN listing_id IS NULL THEN LEAST(buyer_id, seller_id) END,
-    CASE WHEN listing_id IS NULL THEN GREATEST(buyer_id, seller_id) END
-  ) WHERE listing_id IS NULL
+  CONSTRAINT check_participants CHECK (buyer_id != seller_id)
+
+  -- NOTE: the old "unique_direct_conversation" table-level UNIQUE constraint
+  -- using CASE/LEAST/GREATEST + WHERE has been REMOVED from here.
+  -- Postgres does not allow expressions or a WHERE clause inside a table
+  -- CONSTRAINT (...) block — that's what caused:
+  --   ERROR: 42601: syntax error at or near "CASE"
+  -- The equivalent rule is now created below as a partial UNIQUE INDEX
+  -- (see "Indexes for Performance" section, unique_direct_conversation_idx).
 );
 
 -- 2. Messages Table
@@ -48,24 +50,24 @@ CREATE TABLE IF NOT EXISTS public.conversations (
 CREATE TABLE IF NOT EXISTS public.messages (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id uuid REFERENCES public.conversations(id) ON DELETE CASCADE NOT NULL,
-  
+
   -- Sender info
   sender_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   receiver_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
-  
+
   -- Message content
   message_text text NOT NULL,
   message_type text DEFAULT 'text' CHECK (message_type IN ('text', 'image', 'listing', 'system')),
-  
+
   -- Metadata for special message types
   metadata jsonb DEFAULT '{}'::jsonb,
-  
+
   -- Status
   is_read boolean DEFAULT false,
   read_at timestamptz,
   is_deleted boolean DEFAULT false,
   deleted_by_user_id uuid REFERENCES auth.users(id),
-  
+
   -- Timestamps
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -74,7 +76,7 @@ CREATE TABLE IF NOT EXISTS public.messages (
 -- 3. Conversation Participants View
 -- Helper view to get participant details
 CREATE OR REPLACE VIEW public.conversation_participants AS
-SELECT 
+SELECT
   c.id as conversation_id,
   c.listing_id,
   c.buyer_id,
@@ -102,6 +104,14 @@ CREATE INDEX IF NOT EXISTS conversations_listing_id_idx ON public.conversations(
 CREATE INDEX IF NOT EXISTS conversations_last_message_time_idx ON public.conversations(last_message_time DESC);
 CREATE INDEX IF NOT EXISTS conversations_updated_at_idx ON public.conversations(updated_at DESC);
 
+-- FIX: partial unique index replacing the invalid table-level constraint.
+-- Prevents duplicate direct (no-listing) conversations between the same
+-- two users, regardless of who is stored as buyer/seller.
+-- buyer_id and seller_id are both NOT NULL, so NULLS NOT DISTINCT is not needed.
+CREATE UNIQUE INDEX IF NOT EXISTS unique_direct_conversation_idx
+  ON public.conversations (LEAST(buyer_id, seller_id), GREATEST(buyer_id, seller_id))
+  WHERE listing_id IS NULL;
+
 -- Messages indexes
 CREATE INDEX IF NOT EXISTS messages_conversation_id_idx ON public.messages(conversation_id);
 CREATE INDEX IF NOT EXISTS messages_sender_id_idx ON public.messages(sender_id);
@@ -119,22 +129,22 @@ RETURNS TRIGGER AS $$
 BEGIN
   -- Update conversation metadata
   UPDATE public.conversations
-  SET 
+  SET
     last_message_text = NEW.message_text,
     last_message_time = NEW.created_at,
     last_message_sender_id = NEW.sender_id,
     updated_at = NEW.created_at,
     -- Increment unread count for receiver
-    buyer_unread_count = CASE 
+    buyer_unread_count = CASE
       WHEN NEW.receiver_id = buyer_id THEN buyer_unread_count + 1
       ELSE buyer_unread_count
     END,
-    seller_unread_count = CASE 
+    seller_unread_count = CASE
       WHEN NEW.receiver_id = seller_id THEN seller_unread_count + 1
       ELSE seller_unread_count
     END
   WHERE id = NEW.conversation_id;
-  
+
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -150,20 +160,20 @@ RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.is_read = true AND OLD.is_read = false THEN
     UPDATE public.conversations
-    SET 
-      buyer_unread_count = CASE 
-        WHEN NEW.receiver_id = buyer_id AND buyer_unread_count > 0 
+    SET
+      buyer_unread_count = CASE
+        WHEN NEW.receiver_id = buyer_id AND buyer_unread_count > 0
         THEN buyer_unread_count - 1
         ELSE buyer_unread_count
       END,
-      seller_unread_count = CASE 
-        WHEN NEW.receiver_id = seller_id AND seller_unread_count > 0 
+      seller_unread_count = CASE
+        WHEN NEW.receiver_id = seller_id AND seller_unread_count > 0
         THEN seller_unread_count - 1
         ELSE seller_unread_count
       END
     WHERE id = NEW.conversation_id;
   END IF;
-  
+
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -217,16 +227,25 @@ CREATE POLICY "Users can send messages in their conversations"
     )
   );
 
-CREATE POLICY "Users can update their own messages"
+-- FIX: the old single UPDATE policy let EITHER participant (not just the
+-- sender) update ANY column of a message, including message_text — meaning
+-- the receiver could silently edit someone else's message content just to
+-- mark it read. Split into two narrower policies below.
+
+-- Sender can edit their own message content/metadata
+CREATE POLICY "Senders can update their own messages"
   ON public.messages FOR UPDATE
-  USING (
-    auth.uid() = sender_id
-    OR EXISTS (
-      SELECT 1 FROM public.conversations c
-      WHERE c.id = conversation_id
-      AND (c.buyer_id = auth.uid() OR c.seller_id = auth.uid())
-    )
-  );
+  USING (auth.uid() = sender_id)
+  WITH CHECK (auth.uid() = sender_id);
+
+-- Receiver can only update read status on messages sent to them.
+-- (Column-level enforcement of "only is_read/read_at" must additionally be
+-- done in application code or a trigger, since RLS alone can't restrict
+-- which columns an UPDATE touches.)
+CREATE POLICY "Receivers can mark messages as read"
+  ON public.messages FOR UPDATE
+  USING (auth.uid() = receiver_id)
+  WITH CHECK (auth.uid() = receiver_id);
 
 -- =====================================================
 -- Realtime Publication
@@ -252,17 +271,17 @@ BEGIN
   WHERE conversation_id = p_conversation_id
     AND receiver_id = p_user_id
     AND is_read = false;
-    
+
   -- Reset unread count for this user
   UPDATE public.conversations
-  SET 
-    buyer_unread_count = CASE 
-      WHEN buyer_id = p_user_id THEN 0 
-      ELSE buyer_unread_count 
+  SET
+    buyer_unread_count = CASE
+      WHEN buyer_id = p_user_id THEN 0
+      ELSE buyer_unread_count
     END,
-    seller_unread_count = CASE 
-      WHEN seller_id = p_user_id THEN 0 
-      ELSE seller_unread_count 
+    seller_unread_count = CASE
+      WHEN seller_id = p_user_id THEN 0
+      ELSE seller_unread_count
     END
   WHERE id = p_conversation_id;
 END;
@@ -287,21 +306,21 @@ BEGIN
     -- Normalize user IDs to maintain consistent ordering
     v_buyer_id := LEAST(p_user1_id, p_user2_id);
     v_seller_id := GREATEST(p_user1_id, p_user2_id);
-    
+
     -- Try to find existing direct conversation
     SELECT id INTO v_conversation_id
     FROM public.conversations
     WHERE listing_id IS NULL
       AND ((buyer_id = v_buyer_id AND seller_id = v_seller_id)
            OR (buyer_id = v_seller_id AND seller_id = v_buyer_id));
-    
+
     -- If not found, create new direct conversation
     IF v_conversation_id IS NULL THEN
       INSERT INTO public.conversations (listing_id, buyer_id, seller_id)
       VALUES (NULL, v_buyer_id, v_seller_id)
       RETURNING id INTO v_conversation_id;
     END IF;
-    
+
   -- Handle listing-based conversation
   ELSIF p_listing_id IS NOT NULL AND p_buyer_id IS NOT NULL AND p_seller_id IS NOT NULL THEN
     -- Try to find existing conversation
@@ -310,7 +329,7 @@ BEGIN
     WHERE listing_id = p_listing_id
       AND buyer_id = p_buyer_id
       AND seller_id = p_seller_id;
-    
+
     -- If not found, create new conversation
     IF v_conversation_id IS NULL THEN
       INSERT INTO public.conversations (listing_id, buyer_id, seller_id)
@@ -320,7 +339,7 @@ BEGIN
   ELSE
     RAISE EXCEPTION 'Invalid parameters: provide either (listing_id, buyer_id, seller_id) or (user1_id, user2_id)';
   END IF;
-  
+
   RETURN v_conversation_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -331,9 +350,9 @@ RETURNS integer AS $$
 DECLARE
   v_count integer;
 BEGIN
-  SELECT 
+  SELECT
     COALESCE(SUM(
-      CASE 
+      CASE
         WHEN buyer_id = p_user_id THEN buyer_unread_count
         WHEN seller_id = p_user_id THEN seller_unread_count
         ELSE 0
@@ -343,7 +362,7 @@ BEGIN
   FROM public.conversations
   WHERE (buyer_id = p_user_id OR seller_id = p_user_id)
     AND is_archived = false;
-  
+
   RETURN v_count;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
